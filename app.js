@@ -385,9 +385,15 @@ function initialGlyph(label){
 }
 function resolveIconUrl(icon){
   if (!icon) return null;
-  if (icon.startsWith('ipfs://')) return 'https://ipfs.io/ipfs/' + icon.slice(7);
-  if (icon.startsWith('http')) return icon;
-  return null; // emoji or bare string icons render fine as text via initialGlyph fallback
+  let raw = null;
+  if (icon.startsWith('ipfs://')) raw = 'https://ipfs.io/ipfs/' + icon.slice(7);
+  else if (icon.startsWith('http')) raw = icon;
+  if (!raw) return null; // emoji or bare string icons render fine as text via initialGlyph fallback
+  // Route through our own server-side proxy rather than letting the
+  // browser fetch an issuer-controlled URL directly (see api/icon-proxy.js —
+  // this is what stops arbitrary token metadata from being able to make
+  // a visitor's browser probe their own local network).
+  return `/api/icon-proxy?src=${encodeURIComponent(raw)}`;
 }
 function escapeHtml(s){
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));

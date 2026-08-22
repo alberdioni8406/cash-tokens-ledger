@@ -17,7 +17,8 @@ api/
   token-detail.js    — proxies GET tokenstork.com/api/tokens/{id}/{holders|nfts|history}
   bcmr.js            — proxies GET bcmr.paytaca.com/api/tokens/{id}
   latest-block.js    — proxies GET bcmr.paytaca.com/api/status/latest-block/
-vercel.json          — Node 20 runtime for the functions + CORS header on /api/*
+  icon-proxy.js      — fetches token icons server-side; blocks private/loopback/link-local hosts
+vercel.json          — CORS header on /api/* (Vercel auto-detects the .js files under api/ as Node functions; no runtime config needed)
 package.json         — minimal metadata (no dependencies; uses native fetch)
 ```
 
@@ -54,3 +55,8 @@ No environment variables or secrets are required — every upstream API used her
 - TokenStork's holder/NFT/history endpoints don't return data for every category — the UI says so plainly rather than guessing.
 - Header "new tokens" and type-breakdown stats are computed from a sampled pool of a few hundred tokens (not all ~19k), and are marked with `~` where estimated.
 - Token descriptions and icons are supplied by each token's issuer and are not vetted for accuracy by TokenStork, BCMR, or this dashboard.
+
+## Why token icons load through `/api/icon-proxy`
+
+A token's `icon` URL comes from its issuer, not from us — it's untrusted input. Loading it directly in an `<img>` tag would let an issuer point it at a private/local network address (e.g. `http://192.168.1.1/...`), which makes the *visitor's* browser probe their own LAN — this is exactly what triggers Chrome's newer "wants to access other apps and services on this device" (Local Network Access) prompt. Every icon is instead fetched server-side through `api/icon-proxy.js`, which rejects loopback, private (RFC1918), and link-local hosts — including after redirects — before ever returning image bytes to the browser.
+
