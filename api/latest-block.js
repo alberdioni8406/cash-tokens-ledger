@@ -1,20 +1,36 @@
-// /api/latest-block — proxies BCMR's indexer height, shown in the
-// header strip so users can see how fresh the underlying index is.
-
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  if (req.method === 'OPTIONS') return res.status(200).end();
+export default async function handler(req) {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      },
+    });
+  }
 
   try {
     const r = await fetch('https://bcmr.paytaca.com/api/status/latest-block/', {
       headers: { accept: 'application/json' },
     });
-    if (!r.ok) return res.status(r.status).json({ error: `BCMR responded ${r.status}` });
+    if (!r.ok) {
+      return Response.json(
+        { error: `BCMR responded ${r.status}` },
+        { status: r.status, headers: { 'Access-Control-Allow-Origin': '*' } }
+      );
+    }
     const data = await r.json();
-    res.setHeader('Cache-Control', 's-maxage=30, stale-while-revalidate=60');
-    return res.status(200).json(data);
+    return Response.json(data, {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 's-maxage=30, stale-while-revalidate=60',
+      },
+    });
   } catch (err) {
-    return res.status(502).json({ error: 'Could not reach BCMR', detail: String(err) });
+    return Response.json(
+      { error: 'Could not reach BCMR', detail: String(err) },
+      { status: 502, headers: { 'Access-Control-Allow-Origin': '*' } }
+    );
   }
 }
