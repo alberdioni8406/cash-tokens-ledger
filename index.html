@@ -149,9 +149,26 @@
     </div>
   </div>
 
-  <div class="footer">
-    <span>Data: <a href="https://tokenstork.com" target="_blank" rel="noopener">TokenStork</a> · <a href="https://bcmr.paytaca.com" target="_blank" rel="noopener">Paytaca BCMR</a> · Bitcoin Cash CashTokens</span>
-    <span id="footerFetchTimes" class="mono faint">—</span>
+  <div class="footer" style="flex-direction:column; align-items:stretch; gap:12px;">
+    <div class="donate-row">
+      <span class="faint" style="font-size:.72rem; text-transform:uppercase; letter-spacing:.06em;">Support this project</span>
+      <div class="donate-addrs">
+        <button class="donate-chip" data-copy="bitcoincash:qrtv37u522gz8a5lezfqk5vukly93cu7gc8tn09040" title="Click to copy">
+          <span class="donate-label">BCH</span>
+          <span class="mono donate-val">bitcoincash:qrtv37u522gz8a5lezfqk5vukly93cu7gc8tn09040</span>
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+        <button class="donate-chip" data-copy="bitcoincash:zz7pjvq99kylyvns6fjmyawjhxwnucgn2qwyae2ye9" title="Click to copy — accepts CashTokens">
+          <span class="donate-label">Tokens</span>
+          <span class="mono donate-val">bitcoincash:zz7pjvq99kylyvns6fjmyawjhxwnucgn2qwyae2ye9</span>
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+      </div>
+    </div>
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+      <span>Data: <a href="https://tokenstork.com" target="_blank" rel="noopener">TokenStork</a> · <a href="https://bcmr.paytaca.com" target="_blank" rel="noopener">Paytaca BCMR</a> · Bitcoin Cash CashTokens</span>
+      <span id="footerFetchTimes" class="mono faint">—</span>
+    </div>
   </div>
 </div>
 

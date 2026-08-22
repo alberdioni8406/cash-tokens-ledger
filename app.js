@@ -623,6 +623,11 @@ document.getElementById('themeToggle').addEventListener('click', () => {
   applyTheme(current === 'light' ? 'dark' : 'light');
 });
 
+document.querySelector('.footer').addEventListener('click', (e) => {
+  const el = e.target.closest('[data-copy]');
+  if (el) copyToClipboard(el.dataset.copy, el.querySelector('.donate-label')?.textContent || 'Address');
+});
+
 document.querySelectorAll('thead th[data-sort]').forEach(th => {
   th.addEventListener('click', () => {
     const key = th.dataset.sort;
