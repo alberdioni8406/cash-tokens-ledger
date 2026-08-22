@@ -1,35 +1,61 @@
-// /api/token-detail?id=<categoryId>&type=holders|nfts|history
-// Proxies TokenStork's per-token sub-resources for the same CORS
-// reason as /api/tokens.js. One route handles all three so we don't
-// need three near-identical files.
+const ALLOWED = new Set(['holders', 'nfts', 'history']);
 
-const ALLOWED_TYPES = new Set(['holders', 'nfts', 'history']);
-
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  if (req.method === 'OPTIONS') return res.status(200).end();
-
-  const { id, type } = req.query;
-  if (!id) return res.status(400).json({ error: 'Missing required "id" query param' });
-  if (!type || !ALLOWED_TYPES.has(type)) {
-    return res.status(400).json({ error: `"type" must be one of: ${[...ALLOWED_TYPES].join(', ')}` });
+export default async function handler(req) {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      },
+    });
   }
 
-  const upstream = `https://tokenstork.com/api/tokens/${encodeURIComponent(id)}/${type}`;
+  const url = new URL(req.url);
+  const id = url.searchParams.get('id');
+  const type = url.searchParams.get('type');
+
+  if (!id) {
+    return Response.json(
+      { error: 'Missing required "id" query param' },
+      { status: 400, headers: { 'Access-Control-Allow-Origin': '*' } }
+    );
+  }
+  if (!type || !ALLOWED.has(type)) {
+    return Response.json(
+      { error: `"type" must be one of: ${[...ALLOWED].join(', ')}` },
+      { status: 400, headers: { 'Access-Control-Allow-Origin': '*' } }
+    );
+  }
+
+  const upstream = `https://tokenstork.com/api/tokens/\( {encodeURIComponent(id)}/ \){type}`;
 
   try {
     const r = await fetch(upstream, { headers: { accept: 'application/json' } });
+    if (r.status === 404) {
+      return Response.json(null, {
+        status: 200,
+        headers: { 'Access-Control-Allow-Origin': '*' },
+      });
+    }
     if (!r.ok) {
-      // Not every category has holders/nfts/history data — treat 404 as
-      // "no data" rather than an error the client needs to alarm about.
-      if (r.status === 404) return res.status(200).json(null);
-      return res.status(r.status).json({ error: `TokenStork responded ${r.status}` });
+      return Response.json(
+        { error: `TokenStork responded ${r.status}` },
+        { status: r.status, headers: { 'Access-Control-Allow-Origin': '*' } }
+      );
     }
     const data = await r.json();
-    res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
-    return res.status(200).json(data);
+    return Response.json(data, {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 's-maxage=300, stale-while-revalidate=600',
+      },
+    });
   } catch (err) {
-    return res.status(502).json({ error: 'Could not reach TokenStork', detail: String(err) });
+    return Response.json(
+      { error: 'Could not reach TokenStork', detail: String(err) },
+      { status: 502, headers: { 'Access-Control-Allow-Origin': '*' } }
+    );
   }
 }
