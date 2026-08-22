@@ -1,0 +1,9 @@
+{
+  "name": "cashtokens-ledger",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Live directory and radar for CashTokens on Bitcoin Cash, sourced from TokenStork and Paytaca BCMR.",
+  "engines": {
+    "node": ">=18"
+  }
+}
