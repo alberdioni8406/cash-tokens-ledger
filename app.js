@@ -1,12 +1,32 @@
+
 /* =========================================================
-   CashTokens Ledger — app logic (UTXO-native upgrade)
-   Data flow unchanged: TokenStork + BCMR via /api/* proxies.
-   New: holder concentration, UTXO/holder ratios, interpretation,
-   better explorer links (bchexplorer.cash primary).
+   CashTokens Ledger — app logic
+   Data flow:
+     1. fetchTokenPage(offset) hits TokenStork /api/tokens.
+        Results are cached in memory + localStorage (2–5 min TTL).
+     2. The full directory is far too large (~19k+ categories)
+        to hold client-side, so the Explorer table works page
+        by page against TokenStork's own offset pagination,
+        while search/filter are additionally applied client-
+        side against whatever page(s) are currently loaded so
+        results feel instant even if the upstream API ignores
+        a given query param on a given deploy.
+     3. Leaderboards/ticker pull a handful of pages once per
+        session (cached) and rank client-side — good enough
+        for a "top of the ecosystem" view without indexing
+        20k tokens ourselves.
+     4. Opening a token detail panel lazily fetches BCMR
+        metadata + (if available) holders/NFTs for JUST that
+        token, cached per category ID until the tab closes.
    ========================================================= */
 
+// All data goes through our own /api/* Vercel functions rather than
+// tokenstork.com / bcmr.paytaca.com directly. Neither upstream sends
+// Access-Control-Allow-Origin, so a browser fetch() straight to them
+// is blocked by CORS even though a server-side call succeeds — the
+// serverless routes under /api exist specifically to work around that.
 const TOKENSTORK = '/api/tokens';
-const TOKEN_DETAIL = (id, type) => `/api/token-detail?id=\( {encodeURIComponent(id)}&type= \){type}`;
+const TOKEN_DETAIL = (id, type) => `/api/token-detail?id=${encodeURIComponent(id)}&type=${type}`;
 const TOKENSTORK_HOLDERS = (id) => TOKEN_DETAIL(id, 'holders');
 const TOKENSTORK_NFTS = (id) => TOKEN_DETAIL(id, 'nfts');
 const TOKENSTORK_HISTORY = (id) => TOKEN_DETAIL(id, 'history');
@@ -14,26 +34,14 @@ const BCMR_TOKEN = (id) => `/api/bcmr?id=${encodeURIComponent(id)}`;
 const BCMR_LATEST_BLOCK = '/api/latest-block';
 
 const PAGE_SIZE = 100;
-const LIST_CACHE_TTL = 3 * 60 * 1000;
-const DETAIL_CACHE_TTL = 15 * 60 * 1000;
-
-// Preferred BCH explorers (CashTokens-aware where possible)
-const EXPLORER = {
-  primary: (id) => `https://bchexplorer.cash`,
-  token: (id) => `https://tokenstork.com/token/${id}`,
-  cauldron: (id) => `https://cauldron.quest/token/${id}`,
-  ninja: (id) => `https://explorer.bch.ninja/token/${id}`,
-  address: (addr) => {
-    if (!addr || addr === '—') return null;
-    return `https://bchexplorer.cash/address/${encodeURIComponent(addr)}`;
-  },
-};
+const LIST_CACHE_TTL = 3 * 60 * 1000;      // 2–5 min for the directory
+const DETAIL_CACHE_TTL = 15 * 60 * 1000;   // longer for holders/NFTs
 
 const state = {
   offset: 0,
   total: null,
-  rawPage: [],
-  displayRows: [],
+  rawPage: [],          // current page as returned by the API
+  displayRows: [],       // after client-side filter/search/sort
   sortKey: 'genesisTime',
   sortDir: 'desc',
   search: '',
@@ -41,9 +49,9 @@ const state = {
   activeOnly: false,
   newWeekOnly: false,
   minHolders: 0,
-  bcmrCache: {},
-  detailCache: {},
-  samplePages: [],
+  bcmrCache: {},          // categoryId -> bcmr record
+  detailCache: {},        // categoryId -> {holders, nfts}
+  samplePages: [],        // a handful of pages pooled for leaderboards/ticker/stats
   watchlist: new Set(JSON.parse(localStorage.getItem('ctl:watchlist') || '[]')),
   watchlistOnly: false,
 };
@@ -63,6 +71,7 @@ function toggleWatch(id){
   }
 }
 
+// ---------- theme ----------
 function applyTheme(theme){
   document.documentElement.setAttribute('data-theme', theme);
   try { localStorage.setItem('ctl:theme', theme); } catch(e){}
@@ -74,6 +83,7 @@ function initTheme(){
   applyTheme(saved === 'light' ? 'light' : 'dark');
 }
 
+// ---------- tiny cache helpers (memory + localStorage) ----------
 const mem = new Map();
 function cacheGet(key, ttl){
   const hit = mem.get(key);
@@ -90,7 +100,7 @@ function cacheGet(key, ttl){
 function cacheSet(key, v){
   const entry = { t: Date.now(), v };
   mem.set(key, entry);
-  try { localStorage.setItem('ctl:' + key, JSON.stringify(entry)); } catch(e){}
+  try { localStorage.setItem('ctl:' + key, JSON.stringify(entry)); } catch(e){ /* storage full/unavailable — memory cache still works */ }
 }
 
 function toast(msg){
@@ -113,10 +123,6 @@ function fmtNum(n, decimals){
   if (Number.isInteger(num)) return num.toLocaleString();
   return num.toLocaleString(undefined, {maximumFractionDigits:4});
 }
-function fmtPct(n){
-  if (n === null || n === undefined || !isFinite(n)) return '—';
-  return n.toFixed(1) + '%';
-}
 function fmtAgo(unixSeconds){
   if (!unixSeconds) return '—';
   const diff = Date.now()/1000 - unixSeconds;
@@ -133,7 +139,7 @@ function truncId(id, n=8){
 function typeBadge(t){
   const map = { 'FT':['ft','FT'], 'NFT':['nft','NFT'], 'FT+NFT':['hybrid','FT+NFT'] };
   const [cls,label] = map[t] || ['unverified', t || '?'];
-  return `<span class="badge \( {cls}"> \){label}</span>`;
+  return `<span class="badge ${cls}">${label}</span>`;
 }
 function statusBadge(tok){
   if (tok.isFullyBurned) return '<span class="badge burned">● burned</span>';
@@ -146,75 +152,12 @@ function copyToClipboard(text, label){
   });
 }
 
-/* ---------- concentration helpers (real data only) ---------- */
-function computeConcentration(holders, supply){
-  if (!holders || !holders.length || !supply || supply <= 0) {
-    return { top1: null, top5: null, top10: null, remaining: null, largest: null, available: false };
-  }
-  const bals = holders.map(h => Number(h.balance ?? h.amount ?? 0)).filter(n => isFinite(n) && n > 0);
-  bals.sort((a,b) => b - a);
-  const sumN = (n) => bals.slice(0, n).reduce((s,v) => s + v, 0);
-  const top1 = Math.min(100, (sumN(1) / supply) * 100);
-  const top5 = Math.min(100, (sumN(5) / supply) * 100);
-  const top10 = Math.min(100, (sumN(10) / supply) * 100);
-  const remaining = Math.max(0, 100 - top10);
-  return {
-    top1, top5, top10, remaining,
-    largest: top1,
-    available: true,
-    countUsed: bals.length,
-  };
-}
-
-function buildInterpretation(tok, conc, holdersAvailable){
-  if (!tok) return null;
-  const holders = tok.holderCount;
-  const utxos = tok.liveUtxoCount;
-  const parts = [];
-
-  if (holders != null && holders > 0) {
-    parts.push(`This token has \( {fmtNum(holders)} holder \){holders === 1 ? '' : 's'}`);
-  } else {
-    return null;
-  }
-
-  if (conc && conc.available && conc.top10 != null) {
-    parts[0] += `, but the top 10 control ${fmtPct(conc.top10)} of supply`;
-    if (conc.top1 != null && conc.top1 >= 40) {
-      parts.push(`the single largest holder alone holds ${fmtPct(conc.top1)}`);
-    }
-  }
-
-  if (utxos != null && holders > 0) {
-    const ratio = utxos / holders;
-    parts.push(`there are \( {fmtNum(utxos)} live token-bearing UTXOs ( \){ratio.toFixed(2)} UTXOs per holder)`);
-    if (ratio < 0.6 && holders > 20) {
-      parts.push('UTXO count is lower than holder count, suggesting some addresses may share or consolidate outputs');
-    } else if (ratio > 2.5 && holders > 10) {
-      parts.push('supply is fragmented across many more UTXOs than holders');
-    }
-  }
-
-  if (conc && conc.available && conc.top10 != null) {
-    if (conc.top10 >= 75) {
-      parts.push('on-chain concentration is high despite the headline holder count');
-    } else if (conc.top10 <= 25 && holders >= 50) {
-      parts.push('supply appears relatively well distributed among holders');
-    }
-  }
-
-  if (parts.length < 2) return null;
-  let s = parts.join('. ') + '.';
-  s = s.charAt(0).toUpperCase() + s.slice(1);
-  return s;
-}
-
-/* ---------- fetch layer ---------- */
+// ---------- fetch layer ----------
 async function fetchTokenPage(offset){
   const key = `page:${offset}`;
   const cached = cacheGet(key, LIST_CACHE_TTL);
   if (cached) return cached;
-  const res = await fetch(`\( {TOKENSTORK}?limit= \){PAGE_SIZE}&offset=${offset}`);
+  const res = await fetch(`${TOKENSTORK}?limit=${PAGE_SIZE}&offset=${offset}`);
   if (!res.ok) throw new Error('TokenStork responded ' + res.status);
   const data = await res.json();
   cacheSet(key, data);
@@ -262,9 +205,10 @@ async function fetchLatestBlock(){
   } catch(e){ return null; }
 }
 
+// pool a handful of pages once per session for stats/leaderboards/ticker
 async function getSamplePool(){
   if (state.samplePages.length) return state.samplePages.flatMap(p => p.tokens || []);
-  const pagesToPool = 3;
+  const pagesToPool = 3; // 300 tokens — enough for a representative "hot" view without hammering the API
   const pages = [];
   for (let i = 0; i < pagesToPool; i++){
     try { pages.push(await fetchTokenPage(i * PAGE_SIZE)); } catch(e){ break; }
@@ -273,7 +217,7 @@ async function getSamplePool(){
   return pages.flatMap(p => p.tokens || []);
 }
 
-/* ---------- header / charts / ticker ---------- */
+// ---------- rendering: header stats ----------
 async function renderHeaderStats(){
   try {
     const first = await fetchTokenPage(0);
@@ -284,19 +228,19 @@ async function renderHeaderStats(){
     const pool = await getSamplePool();
     const burned = pool.filter(t => t.isFullyBurned).length;
     const burnedShare = pool.length ? Math.round((burned/pool.length) * state.total) : null;
-    document.getElementById('statBurned').textContent = burnedShare !== null ? '\~' + fmtNum(burnedShare) : fmtNum(burned);
+    document.getElementById('statBurned').textContent = burnedShare !== null ? '~' + fmtNum(burnedShare) : fmtNum(burned);
 
     const now = Date.now()/1000;
     const new24h = pool.filter(t => t.firstSeenAt && (now - t.firstSeenAt) < 86400).length;
-    document.getElementById('statNew24h').textContent = pool.length < state.total ? '\~' + new24h + '*' : new24h;
+    document.getElementById('statNew24h').textContent = pool.length < state.total ? '~' + new24h + '*' : new24h;
 
     const ft = pool.filter(t => t.tokenType === 'FT').length;
     const nft = pool.filter(t => t.tokenType === 'NFT').length;
     const hybrid = pool.filter(t => t.tokenType === 'FT+NFT').length;
     const scale = pool.length ? state.total / pool.length : 1;
-    document.getElementById('kpiFT').textContent = '\~' + fmtNum(Math.round(ft*scale));
-    document.getElementById('kpiNFT').textContent = '\~' + fmtNum(Math.round(nft*scale));
-    document.getElementById('kpiHybrid').textContent = '\~' + fmtNum(Math.round(hybrid*scale));
+    document.getElementById('kpiFT').textContent = '~' + fmtNum(Math.round(ft*scale));
+    document.getElementById('kpiNFT').textContent = '~' + fmtNum(Math.round(nft*scale));
+    document.getElementById('kpiHybrid').textContent = '~' + fmtNum(Math.round(hybrid*scale));
   } catch(e){
     document.getElementById('statTotal').textContent = 'offline';
     toast('Could not reach TokenStork — showing cached data if any');
@@ -304,10 +248,12 @@ async function renderHeaderStats(){
 
   const block = await fetchLatestBlock();
   document.getElementById('statBlock').textContent = block ? fmtNum(block) : '—';
+
   document.getElementById('lastFetchTag').textContent = new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
   document.getElementById('footerFetchTimes').textContent = 'last synced ' + new Date().toLocaleTimeString();
 }
 
+// ---------- genesis activity mini chart ----------
 let genesisChartInstance = null;
 async function renderGenesisChart(){
   const pool = await getSamplePool();
@@ -341,6 +287,7 @@ async function renderGenesisChart(){
   });
 }
 
+// ---------- ticker ----------
 async function renderTicker(){
   const pool = await getSamplePool();
   const recent = [...pool].filter(t => t.genesisTime).sort((a,b) => b.genesisTime - a.genesisTime).slice(0, 20);
@@ -352,10 +299,11 @@ async function renderTicker(){
       <span>${typeBadge(t.tokenType)}</span>
       <span class="age">${fmtAgo(t.genesisTime)}</span>
     </div>`).join('');
+  // duplicate for seamless loop
   track.innerHTML = itemsHtml + itemsHtml;
 }
 
-/* ---------- explorer table ---------- */
+// ---------- explorer table ----------
 function applyClientFilters(tokens){
   let rows = tokens;
   const q = state.search.trim().toLowerCase();
@@ -400,7 +348,7 @@ function renderTable(){
       <tr data-id="${t.id}">
         <td>
           <div class="token-cell">
-            <button class="watch-star \( {state.watchlist.has(t.id) ? 'active' : ''}" data-watch=" \){t.id}" title="${state.watchlist.has(t.id) ? 'Remove from' : 'Add to'} watchlist">★</button>
+            <button class="watch-star ${state.watchlist.has(t.id) ? 'active' : ''}" data-watch="${t.id}" title="${state.watchlist.has(t.id) ? 'Remove from' : 'Add to'} watchlist">★</button>
             <div class="token-icon">${iconHtml(t)}</div>
             <div>
               <div class="token-name">${escapeHtml(t.name || 'Unnamed')}</div>
@@ -408,7 +356,7 @@ function renderTable(){
             </div>
           </div>
         </td>
-        <td><span class="copy-id" data-copy="\( {t.id}" title="Click to copy full ID"> \){truncId(t.id)} <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span></td>
+        <td><span class="copy-id" data-copy="${t.id}" title="Click to copy full ID">${truncId(t.id)} <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span></td>
         <td>${typeBadge(t.tokenType)}</td>
         <td class="num-cell">${fmtNum(t.currentSupply, t.decimals)}</td>
         <td class="num-cell">${fmtNum(t.holderCount)}</td>
@@ -429,7 +377,7 @@ function renderTable(){
 function iconHtml(t){
   const src = resolveIconUrl(t.icon);
   if (!src) return initialGlyph(t.symbol || t.name);
-  return `<img src="\( {src}" alt="" loading="lazy" onerror="this.parentElement.innerHTML=initialGlyph(' \){escapeHtml((t.symbol||t.name||'?')).replace(/'/g,"")}')">`;
+  return `<img src="${src}" alt="" loading="lazy" onerror="this.parentElement.innerHTML=initialGlyph('${escapeHtml((t.symbol||t.name||'?')).replace(/'/g,"")}')">`;
 }
 function initialGlyph(label){
   const ch = (label || '?').trim().charAt(0).toUpperCase() || '?';
@@ -440,7 +388,11 @@ function resolveIconUrl(icon){
   let raw = null;
   if (icon.startsWith('ipfs://')) raw = 'https://ipfs.io/ipfs/' + icon.slice(7);
   else if (icon.startsWith('http')) raw = icon;
-  if (!raw) return null;
+  if (!raw) return null; // emoji or bare string icons render fine as text via initialGlyph fallback
+  // Route through our own server-side proxy rather than letting the
+  // browser fetch an issuer-controlled URL directly (see api/icon-proxy.js —
+  // this is what stops arbitrary token metadata from being able to make
+  // a visitor's browser probe their own local network).
   return `/api/icon-proxy?src=${encodeURIComponent(raw)}`;
 }
 function escapeHtml(s){
@@ -451,7 +403,7 @@ function updatePagerInfo(){
   const startIdx = state.offset + 1;
   const endIdx = state.offset + (state.rawPage?.length || 0);
   document.getElementById('pagerInfo').textContent =
-    `Showing \( {startIdx.toLocaleString()}– \){endIdx.toLocaleString()} of ${fmtNum(state.total)} tracked categories` +
+    `Showing ${startIdx.toLocaleString()}–${endIdx.toLocaleString()} of ${fmtNum(state.total)} tracked categories` +
     (state.search || state.typeFilter || state.activeOnly || state.newWeekOnly || state.minHolders ? ' (filtered within this page)' : '');
   document.getElementById('prevPage').disabled = state.offset <= 0;
   document.getElementById('nextPage').disabled = state.total !== null && state.offset + PAGE_SIZE >= state.total;
@@ -470,7 +422,7 @@ async function loadPage(offset){
   }
 }
 
-/* ---------- leaderboards ---------- */
+// ---------- leaderboards ----------
 async function renderLeaderboards(){
   const pool = await getSamplePool();
   const byHolders = [...pool].filter(t=>t.holderCount).sort((a,b)=>b.holderCount-a.holderCount).slice(0,10);
@@ -479,7 +431,7 @@ async function renderLeaderboards(){
 
   const row = (t, val) => `
     <div class="lb-row" data-id="${t.id}" style="cursor:pointer">
-      <div class="lb-name"><div class="n">\( {escapeHtml(t.name||'Unnamed')}</div><div class="s"> \){escapeHtml(t.symbol||'—')}</div></div>
+      <div class="lb-name"><div class="n">${escapeHtml(t.name||'Unnamed')}</div><div class="s">${escapeHtml(t.symbol||'—')}</div></div>
       <div class="lb-val">${val}</div>
     </div>`;
 
@@ -496,7 +448,7 @@ function findInPool(id){
   return state.rawPage.find(t=>t.id===id) || null;
 }
 
-/* ---------- DETAIL PANEL (upgraded) ---------- */
+// ---------- detail panel ----------
 async function openDetail(id, knownToken){
   document.getElementById('overlay').classList.add('open');
   const panel = document.getElementById('detailPanel');
@@ -506,76 +458,51 @@ async function openDetail(id, knownToken){
   panel.innerHTML = detailSkeleton(tok, id);
   wireDetailStaticButtons(id, tok);
 
+  // enrich with BCMR if the on-chain record is sparse
   let bcmr = null;
   if (tok && (!tok.description || !tok.icon || !tok.name)) {
     bcmr = await fetchBcmr(id);
   }
   const merged = mergeBcmr(tok, bcmr);
-
   panel.querySelector('.receipt').outerHTML = receiptHtml(merged, id);
-  const oldMetrics = panel.querySelector('.metric-grid');
-  if (oldMetrics) oldMetrics.remove();
+  panel.querySelector('.metric-grid')?.remove();
   const metricGrid = document.createElement('div');
   metricGrid.className = 'metric-grid';
   metricGrid.innerHTML = metricsHtml(merged);
   panel.querySelector('.receipt').after(metricGrid);
   wireDetailStaticButtons(id, merged);
 
+  // holders / nfts / history
   const holdersSection = panel.querySelector('#holdersSection');
-  const utxoSection = panel.querySelector('#utxoSection');
-  const interpretSection = panel.querySelector('#interpretSection');
   try {
     const details = await fetchHoldersAndNfts(id);
-    renderAnalyticsSections(holdersSection, utxoSection, interpretSection, details, merged);
+    renderHoldersSection(holdersSection, details, merged);
   } catch(e){
-    holdersSection.innerHTML = `<h4>Holder Distribution</h4><div class="state-msg faint">Holder breakdown isn't available for this category right now.</div>`;
-    if (utxoSection) utxoSection.innerHTML = utxoUnavailableHtml(merged);
-    if (interpretSection) interpretSection.innerHTML = '';
+    holdersSection.innerHTML = `<h4>Top holders</h4><div class="state-msg faint">Holder breakdown isn't available for this category right now.</div>`;
   }
 }
 
 function detailSkeleton(tok, id){
   return `
     <div class="detail-close">
-      <button class="watch-star \( {state.watchlist.has(id) ? 'active' : ''}" data-id=" \){id}" id="detailWatchBtn" title="Toggle watchlist" style="margin-right:auto; margin-left:16px;">★</button>
+      <button class="watch-star ${state.watchlist.has(id) ? 'active' : ''}" data-id="${id}" id="detailWatchBtn" title="Toggle watchlist" style="margin-right:auto; margin-left:16px;">★</button>
       <button id="closeDetailBtn" aria-label="Close">✕</button>
     </div>
     ${receiptHtml(tok, id)}
     <div class="metric-grid">${metricsHtml(tok)}</div>
-
     <div class="detail-section">
       <h4>Category</h4>
-      <div class="id-row"><span class="val">\( {id}</span><button data-copy=" \){id}" title="Copy category ID">⧉</button></div>
+      <div class="id-row"><span class="val">${id}</span><button data-copy="${id}" title="Copy category ID">⧉</button></div>
       <div class="link-row">
-        <a class="link-btn" target="_blank" rel="noopener" href="${EXPLORER.primary(id)}">bchexplorer</a>
-        <a class="link-btn" target="_blank" rel="noopener" href="${EXPLORER.token(id)}">TokenStork</a>
-        <a class="link-btn" target="_blank" rel="noopener" href="${EXPLORER.cauldron(id)}">Cauldron</a>
-        <a class="link-btn" target="_blank" rel="noopener" href="${EXPLORER.ninja(id)}">bch.ninja</a>
+        <a class="link-btn" target="_blank" rel="noopener" href="https://explorer.bch.ninja/token/${id}">Explorer</a>
+        <a class="link-btn" target="_blank" rel="noopener" href="https://tokenstork.com/token/${id}">TokenStork</a>
+        <a class="link-btn" target="_blank" rel="noopener" href="https://cauldron.quest/token/${id}">Cauldron</a>
       </div>
     </div>
-
     <div class="detail-section" id="holdersSection">
-      <h4>Holder Distribution</h4>
+      <h4>Top holders</h4>
       <div class="state-msg"><span class="spinner"></span>loading holder breakdown…</div>
     </div>
-
-    <div class="detail-section" id="utxoSection">
-      <h4>UTXO Distribution</h4>
-      <div class="state-msg faint">Loading…</div>
-    </div>
-
-    <div class="detail-section" id="ageMoveSection">
-      <h4>UTXO Age &amp; Movement</h4>
-      <div class="unavailable-box">
-        <div class="unavail-label">Unavailable</div>
-        <p class="faint" style="margin:6px 0 0;font-size:.78rem;line-height:1.5">
-          Public TokenStork endpoints do not currently expose per-UTXO creation heights or recent spend/create events.
-          Age buckets and 24h/7d/30d movement will appear here when a richer indexer feed is available.
-        </p>
-      </div>
-    </div>
-
-    <div class="detail-section" id="interpretSection"></div>
   `;
 }
 
@@ -601,18 +528,10 @@ function receiptHtml(tok, id){
 
 function metricsHtml(tok){
   if (!tok) return '';
-  const holders = tok.holderCount;
-  const utxos = tok.liveUtxoCount;
-  let ratioHtml = '';
-  if (holders > 0 && utxos != null) {
-    const r = utxos / holders;
-    ratioHtml = `<div class="metric derived"><div class="v">${r.toFixed(2)}</div><div class="k">UTXOs / holder <span class="tag-d">derived</span></div></div>`;
-  }
   return `
     <div class="metric"><div class="v">${fmtNum(tok.currentSupply, tok.decimals)}</div><div class="k">Current supply</div></div>
-    <div class="metric"><div class="v">${fmtNum(holders)}</div><div class="k">Holders</div></div>
-    <div class="metric"><div class="v">${fmtNum(utxos)}</div><div class="k">Live UTXOs</div></div>
-    ${ratioHtml}
+    <div class="metric"><div class="v">${fmtNum(tok.holderCount)}</div><div class="k">Holders</div></div>
+    <div class="metric"><div class="v">${fmtNum(tok.liveUtxoCount)}</div><div class="k">Live UTXOs</div></div>
     <div class="metric"><div class="v">${fmtNum(tok.liveNftCount)}</div><div class="k">Live NFTs</div></div>
     <div class="metric"><div class="v">${tok.genesisBlock ? '#'+fmtNum(tok.genesisBlock) : '—'}</div><div class="k">Genesis block</div></div>
     <div class="metric"><div class="v">${fmtAgo(tok.genesisTime)}</div><div class="k">Genesis time</div></div>
@@ -622,6 +541,7 @@ function metricsHtml(tok){
 function mergeBcmr(tok, bcmr){
   if (!tok) return tok;
   if (!bcmr) return tok;
+  // BCMR shape varies; pull common fields defensively without overwriting good TokenStork data
   const b = bcmr.token || bcmr;
   return {
     ...tok,
@@ -632,55 +552,18 @@ function mergeBcmr(tok, bcmr){
   };
 }
 
-function renderAnalyticsSections(holdersEl, utxoEl, interpretEl, details, tok){
+function renderHoldersSection(el, details, tok){
   const holders = details?.holders?.holders || details?.holders?.data || (Array.isArray(details?.holders) ? details.holders : null);
   const nfts = details?.nfts?.nfts || details?.nfts?.data || (Array.isArray(details?.nfts) ? details.nfts : null);
-  const supply = Number(tok?.currentSupply) || 0;
-  const conc = computeConcentration(holders, supply);
-
-  let html = '<h4>Holder Distribution</h4>';
-
-  if (conc.available) {
-    html += `
-      <div class="conc-grid">
-        <div class="conc-card"><div class="cv">${fmtPct(conc.top1)}</div><div class="ck">Top 1</div></div>
-        <div class="conc-card"><div class="cv">${fmtPct(conc.top5)}</div><div class="ck">Top 5</div></div>
-        <div class="conc-card"><div class="cv">${fmtPct(conc.top10)}</div><div class="ck">Top 10</div></div>
-        <div class="conc-card"><div class="cv">${fmtPct(conc.remaining)}</div><div class="ck">Remaining</div></div>
-      </div>
-      <div class="conc-bar" title="Supply distribution">
-        <div class="seg top1" style="width:${conc.top1.toFixed(1)}%"></div>
-        <div class="seg top5" style="width:${Math.max(0, conc.top5 - conc.top1).toFixed(1)}%"></div>
-        <div class="seg top10" style="width:${Math.max(0, conc.top10 - conc.top5).toFixed(1)}%"></div>
-        <div class="seg rest" style="width:${conc.remaining.toFixed(1)}%"></div>
-      </div>
-      <div class="conc-legend">
-        <span><i class="sw top1"></i>Top 1</span>
-        <span><i class="sw top5"></i>Top 5</span>
-        <span><i class="sw top10"></i>Top 10</span>
-        <span><i class="sw rest"></i>Rest</span>
-      </div>
-      <p class="faint" style="font-size:.72rem;margin:8px 0 12px">
-        Concentration calculated from the ${conc.countUsed} addresses returned by the indexer (exact balances).
-        Holder count alone can hide concentration — ${fmtNum(tok.holderCount)} holders with top-10 at ${fmtPct(conc.top10)} is very different from a flat distribution.
-      </p>
-    `;
-  } else {
-    html += `<p class="faint" style="font-size:.8rem;margin-bottom:12px">Aggregate holder count is available; per-address balances are not exposed for this category, so concentration % cannot be calculated.</p>`;
-  }
-
+  let html = '<h4>Top holders</h4>';
   if (holders && holders.length){
-    html += holders.slice(0,10).map((h, idx) => {
+    const supply = Number(tok?.currentSupply) || 0;
+    html += holders.slice(0,10).map(h => {
       const bal = Number(h.balance ?? h.amount ?? 0);
       const pct = supply ? Math.min(100, (bal/supply)*100) : 0;
       const addr = h.address || h.lockingBytecode || '—';
-      const addrLink = EXPLORER.address(addr);
-      const addrHtml = addrLink
-        ? `<a class="holder-addr" href="\( {addrLink}" target="_blank" rel="noopener" title=" \){escapeHtml(addr)}">${escapeHtml(truncId(addr,6))}</a>`
-        : `<span class="holder-addr" title="\( {escapeHtml(addr)}"> \){escapeHtml(truncId(addr,6))}</span>`;
       return `<div class="holder-row">
-        <span class="holder-rank">#${idx+1}</span>
-        ${addrHtml}
+        <span class="holder-addr" title="${escapeHtml(addr)}">${escapeHtml(truncId(addr,6))}</span>
         <span class="holder-bar-wrap"><span class="holder-bar" style="width:${pct.toFixed(1)}%"></span></span>
         <span class="holder-pct">${pct.toFixed(1)}%</span>
       </div>`;
@@ -688,73 +571,11 @@ function renderAnalyticsSections(holdersEl, utxoEl, interpretEl, details, tok){
   } else {
     html += '<div class="state-msg faint">No public per-address holder breakdown is exposed for this category — only the aggregate holder count shown above.</div>';
   }
-
   if (nfts && nfts.length){
-    html += `<h4 style="margin-top:18px;">NFT instances (${nfts.length})</h4>` +
-      nfts.slice(0,8).map(n => `<div class="holder-row"><span class="holder-addr">\( {escapeHtml(n.commitment ? '#'+n.commitment : (n.id||'instance'))}</span><span class="dim" style="font-size:.7rem"> \){escapeHtml(n.capability||'')}</span></div>`).join('');
+    html += `<h4 style="margin-top:16px;">NFT instances (${nfts.length})</h4>` +
+      nfts.slice(0,8).map(n => `<div class="holder-row"><span class="holder-addr">${escapeHtml(n.commitment ? '#'+n.commitment : (n.id||'instance'))}</span><span class="dim" style="font-size:.7rem">${escapeHtml(n.capability||'')}</span></div>`).join('');
   }
-
-  holdersEl.innerHTML = html;
-
-  if (utxoEl) {
-    utxoEl.innerHTML = utxoSectionHtml(tok, conc);
-  }
-
-  if (interpretEl) {
-    const text = buildInterpretation(tok, conc, !!(holders && holders.length));
-    if (text) {
-      interpretEl.innerHTML = `
-        <h4>On-Chain Interpretation</h4>
-        <div class="interpret-box">
-          <p>${escapeHtml(text)}</p>
-          <div class="faint" style="font-size:.68rem;margin-top:8px">Generated strictly from available exact + derived metrics. No estimates.</div>
-        </div>
-      `;
-    } else {
-      interpretEl.innerHTML = '';
-    }
-  }
-}
-
-function utxoSectionHtml(tok, conc){
-  const utxos = tok?.liveUtxoCount;
-  const holders = tok?.holderCount;
-  const supply = Number(tok?.currentSupply) || 0;
-  const decimals = tok?.decimals || 0;
-
-  let derived = '';
-  if (utxos > 0 && supply > 0) {
-    const perUtxo = supply / utxos;
-    derived += `<div class="metric derived"><div class="v">${fmtNum(perUtxo, decimals)}</div><div class="k">Avg tokens / UTXO <span class="tag-d">derived</span></div></div>`;
-  }
-  if (holders > 0 && supply > 0) {
-    const perHolder = supply / holders;
-    derived += `<div class="metric derived"><div class="v">${fmtNum(perHolder, decimals)}</div><div class="k">Avg tokens / holder <span class="tag-d">derived</span></div></div>`;
-  }
-  if (holders > 0 && utxos != null) {
-    derived += `<div class="metric derived"><div class="v">${(utxos/holders).toFixed(2)}</div><div class="k">UTXOs per holder <span class="tag-d">derived</span></div></div>`;
-  }
-
-  return `
-    <h4>UTXO Distribution</h4>
-    <div class="metric-grid compact">
-      <div class="metric"><div class="v">${fmtNum(utxos)}</div><div class="k">Token-bearing UTXOs</div></div>
-      ${derived}
-    </div>
-    <div class="unavailable-box" style="margin-top:12px">
-      <div class="unavail-label">Size buckets · median · largest/smallest</div>
-      <p class="faint" style="margin:6px 0 0;font-size:.78rem;line-height:1.5">
-        Unavailable — requires the full set of token amounts on each UTXO. Public aggregator endpoints currently return only the live UTXO <em>count</em>, not the per-UTXO balances needed for size distribution charts.
-      </p>
-    </div>
-    <p class="faint" style="font-size:.72rem;margin-top:10px">
-      A single holder/address may control one, several, or many UTXOs. Do not assume holder count = UTXO count.
-    </p>
-  `;
-}
-
-function utxoUnavailableHtml(tok){
-  return utxoSectionHtml(tok, null);
+  el.innerHTML = html;
 }
 
 function wireDetailStaticButtons(id, tok){
@@ -769,7 +590,7 @@ function closeDetail(){
   document.getElementById('detailPanel').classList.remove('open');
 }
 
-/* ---------- event wiring ---------- */
+// ---------- event wiring ----------
 document.getElementById('overlay').addEventListener('click', closeDetail);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDetail(); });
 
@@ -870,8 +691,10 @@ async function refreshAll(force){
   }
 }
 
+// ---------- boot ----------
 (function init(){
   initTheme();
+  // show cached page instantly if we have one, then refresh in background
   const cachedFirst = cacheGet('page:0', LIST_CACHE_TTL);
   if (cachedFirst){
     state.rawPage = cachedFirst.tokens || [];
@@ -879,5 +702,5 @@ async function refreshAll(force){
     renderTable();
   }
   refreshAll(false);
-  setInterval(() => refreshAll(false), 5 * 60 * 1000);
+  setInterval(() => refreshAll(false), 5 * 60 * 1000); // background sync every 5 min
 })();
